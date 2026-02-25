@@ -1,0 +1,38 @@
+# Environment / secrets
+.env
+keys.env
+
+# Database (user-specific data, not committed)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary query scripts
+query.py
+check.py
