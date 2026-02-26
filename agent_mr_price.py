@@ -270,12 +270,39 @@ def _normalize_slug(slug: str) -> str:
     return slug
 
 
+# LiteLLM prefixes that represent canonical/official provider pricing
+# Third-party hosts (deepinfra/, perplexity/, fireworks_ai/, novita/, etc.) are excluded
+# from being the authoritative direct price for markup/route comparisons
+CANONICAL_PREFIXES = {
+    "anthropic", "openai", "azure", "azure_ai", "google", "vertex_ai",
+    "mistral", "mistralai", "deepseek", "xai", "x-ai", "cohere",
+    "amazon", "amazon-nova", "dashscope", "minimax", "morph",
+    "openrouter",   # openrouter/* entries in LiteLLM = same price, valid reference
+}
+
+
+def _ll_priority(model_id: str) -> int:
+    """Lower = higher priority. Canonical providers score 0, third-party hosts score 1."""
+    prefix = model_id.lower().split("/")[0]
+    return 0 if prefix in CANONICAL_PREFIXES else 1
+
+
 def calc_markups(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str) -> list[dict]:
     # Build LiteLLM lookup keyed by normalized slug
+    # Canonical providers (anthropic/, openai/, mistral/ etc.) take priority over
+    # third-party hosts (deepinfra/, perplexity/, fireworks_ai/ etc.)
     ll_lookup: dict[str, dict] = {}
     for r in ll_rows:
         key = _normalize_slug(r["model_id"])
-        if key not in ll_lookup or r["input_cost_mtok"] < ll_lookup[key]["input_cost_mtok"]:
+        existing = ll_lookup.get(key)
+        if not existing:
+            ll_lookup[key] = r
+        elif _ll_priority(r["model_id"]) < _ll_priority(existing["model_id"]):
+            # Canonical provider beats third-party host
+            ll_lookup[key] = r
+        elif (_ll_priority(r["model_id"]) == _ll_priority(existing["model_id"])
+              and r["input_cost_mtok"] < existing["input_cost_mtok"]):
+            # Same tier — keep cheaper
             ll_lookup[key] = r
 
     # OR model suffixes that indicate a different product with no direct equivalent
@@ -295,6 +322,10 @@ def calc_markups(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str) -> 
         # Exact normalized match only — no substring fuzzy matching
         ll_match = ll_lookup.get(base)
         if not ll_match:
+            continue
+
+        # Skip if the best match is a third-party host — not a valid direct price comparison
+        if _ll_priority(ll_match["model_id"]) > 0:
             continue
 
         d_inp, o_inp = ll_match["input_cost_mtok"],  or_row["input_cost_mtok"]
@@ -321,11 +352,17 @@ def calc_best_routes(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str)
     Models with no direct price match default to openrouter.
     Returns one row per OR model with best_path, best_input_mtok, best_output_mtok.
     """
-    # Build LiteLLM lookup keyed by normalized slug
+    # Build LiteLLM lookup keyed by normalized slug, canonical providers take priority
     ll_lookup: dict[str, dict] = {}
     for r in ll_rows:
         key = _normalize_slug(r["model_id"])
-        if key not in ll_lookup or r["input_cost_mtok"] < ll_lookup[key]["input_cost_mtok"]:
+        existing = ll_lookup.get(key)
+        if not existing:
+            ll_lookup[key] = r
+        elif _ll_priority(r["model_id"]) < _ll_priority(existing["model_id"]):
+            ll_lookup[key] = r
+        elif (_ll_priority(r["model_id"]) == _ll_priority(existing["model_id"])
+              and r["input_cost_mtok"] < existing["input_cost_mtok"]):
             ll_lookup[key] = r
 
     routes = []

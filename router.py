@@ -162,11 +162,17 @@ def load_candidates(conn: sqlite3.Connection) -> list[Candidate]:
 
         _, best_path, inp, out, blended, or_inp, or_out, d_inp, d_out = bp
 
+        # Only use direct path if we actually have an active key for that provider
+        provider = or_id.split("/")[0]
+        if best_path == "direct" and not ACTIVE_KEYS.get(provider):
+            best_path = "openrouter"
+            inp, out, blended = or_inp, or_out, round((or_inp + or_out * 3) / 4, 6)
+
         candidates.append(Candidate(
             aa_model_id        = aa_id,
             model_name         = row[1] or aa_id,
             or_model_id        = or_id,
-            provider           = or_id.split("/")[0],
+            provider           = provider,
             intelligence_index = row[2],
             coding_index       = row[3],
             math_index         = row[4],
@@ -179,38 +185,6 @@ def load_candidates(conn: sqlite3.Connection) -> list[Candidate]:
             routing_path       = best_path,
             direct_input_mtok  = d_inp,
             direct_output_mtok = d_out,
-        ))
-
-    return candidates
-
-    candidates = []
-    for row in quality_rows:
-        aa_id = row[0]
-        or_id = AA_TO_OR.get(aa_id)
-        if not or_id:
-            continue   # not in our mapping
-
-        pricing = or_prices.get(or_id)
-        if not pricing:
-            continue   # not available on OR right now
-
-        inp, out = pricing
-        blended = round((inp + out * 3) / 4, 4)   # 1:3 input:output ratio
-
-        candidates.append(Candidate(
-            aa_model_id        = aa_id,
-            model_name         = row[1] or aa_id,
-            or_model_id        = or_id,
-            provider           = or_id.split("/")[0],
-            intelligence_index = row[2],
-            coding_index       = row[3],
-            math_index         = row[4],
-            mmlu_pro           = row[5],
-            input_cost_mtok    = inp,
-            output_cost_mtok   = out,
-            blended_cost_mtok  = blended,
-            quality_score      = None,
-            quality_per_dollar = None,
         ))
 
     return candidates
