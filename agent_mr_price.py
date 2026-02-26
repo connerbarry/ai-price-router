@@ -103,6 +103,22 @@ def init_db(conn: sqlite3.Connection):
             output_markup_pct       REAL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS best_price_snapshots (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_ts         TEXT    NOT NULL,
+            or_model_id         TEXT    NOT NULL,
+            provider            TEXT,
+            best_path           TEXT    NOT NULL,
+            best_input_mtok     REAL    NOT NULL,
+            best_output_mtok    REAL    NOT NULL,
+            best_blended_mtok   REAL    NOT NULL,
+            or_input_mtok       REAL,
+            or_output_mtok      REAL,
+            direct_input_mtok   REAL,
+            direct_output_mtok  REAL
+        )
+    """)
     for idx in [
         "CREATE INDEX IF NOT EXISTS idx_ps_ts     ON price_snapshots(snapshot_ts)",
         "CREATE INDEX IF NOT EXISTS idx_ps_model  ON price_snapshots(model_id)",
@@ -110,6 +126,8 @@ def init_db(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_qs_ts     ON quality_snapshots(snapshot_ts)",
         "CREATE INDEX IF NOT EXISTS idx_qs_model  ON quality_snapshots(aa_model_id)",
         "CREATE INDEX IF NOT EXISTS idx_mu_ts     ON markup_snapshots(snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_bp_ts     ON best_price_snapshots(snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_bp_model  ON best_price_snapshots(or_model_id)",
     ]:
         conn.execute(idx)
     conn.commit()
@@ -244,23 +262,41 @@ def parse_aa(models: list[dict], snapshot_ts: str) -> list[dict]:
 
 
 # ── Markup Calculator ─────────────────────────────────────────────────────────
+def _normalize_slug(slug: str) -> str:
+    """Normalize model slug for comparison — dots to dashes, lowercase, strip provider prefix."""
+    slug = slug.lower().split("/")[-1]   # strip provider prefix
+    slug = slug.replace(".", "-")         # dots → dashes (claude-opus-4.6 → claude-opus-4-6)
+    slug = slug.split(":")[0]            # strip variant suffixes (:thinking, :exacto, etc.)
+    return slug
+
+
 def calc_markups(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str) -> list[dict]:
+    # Build LiteLLM lookup keyed by normalized slug
     ll_lookup: dict[str, dict] = {}
     for r in ll_rows:
-        key = r["model_id"].lower()
+        key = _normalize_slug(r["model_id"])
         if key not in ll_lookup or r["input_cost_mtok"] < ll_lookup[key]["input_cost_mtok"]:
             ll_lookup[key] = r
+
+    # OR model suffixes that indicate a different product with no direct equivalent
+    NO_MATCH_SUFFIXES = {"-pro", "-max", "-deep-research"}
 
     markups = []
     for or_row in or_rows:
         if or_row["is_free"]:
             continue
-        base = or_row["model_id"].split("/", 1)[-1].lower()
-        ll_match = ll_lookup.get(base) or next(
-            (v for k, v in ll_lookup.items() if base in k or k in base), None
-        )
+
+        base = _normalize_slug(or_row["model_id"])
+
+        # Skip OR variants that don't have a true direct price equivalent
+        if any(base.endswith(s) for s in NO_MATCH_SUFFIXES):
+            continue
+
+        # Exact normalized match only — no substring fuzzy matching
+        ll_match = ll_lookup.get(base)
         if not ll_match:
             continue
+
         d_inp, o_inp = ll_match["input_cost_mtok"],  or_row["input_cost_mtok"]
         d_out, o_out = ll_match["output_cost_mtok"], or_row["output_cost_mtok"]
         if d_inp <= 0 or d_out <= 0:
@@ -277,6 +313,64 @@ def calc_markups(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str) -> 
             "output_markup_pct":      round((o_out - d_out) / d_out * 100, 2),
         })
     return markups
+
+
+def calc_best_routes(or_rows: list[dict], ll_rows: list[dict], snapshot_ts: str) -> list[dict]:
+    """
+    For every OR model, compare OR price vs direct provider price and pick the cheapest path.
+    Models with no direct price match default to openrouter.
+    Returns one row per OR model with best_path, best_input_mtok, best_output_mtok.
+    """
+    # Build LiteLLM lookup keyed by normalized slug
+    ll_lookup: dict[str, dict] = {}
+    for r in ll_rows:
+        key = _normalize_slug(r["model_id"])
+        if key not in ll_lookup or r["input_cost_mtok"] < ll_lookup[key]["input_cost_mtok"]:
+            ll_lookup[key] = r
+
+    routes = []
+    for or_row in or_rows:
+        if or_row["is_free"]:
+            continue
+
+        or_inp = or_row["input_cost_mtok"]
+        or_out = or_row["output_cost_mtok"]
+        or_blended = (or_inp + or_out * 3) / 4
+
+        base = _normalize_slug(or_row["model_id"])
+        ll_match = ll_lookup.get(base)
+
+        if ll_match:
+            d_inp = ll_match["input_cost_mtok"]
+            d_out = ll_match["output_cost_mtok"]
+            # Reject zero/invalid direct prices — fall back to OR
+            if d_inp > 0 and d_out > 0:
+                d_blended = (d_inp + d_out * 3) / 4
+                if d_blended < or_blended:
+                    best_path, best_inp, best_out, best_blended = "direct", d_inp, d_out, d_blended
+                else:
+                    best_path, best_inp, best_out, best_blended = "openrouter", or_inp, or_out, or_blended
+            else:
+                best_path, best_inp, best_out, best_blended = "openrouter", or_inp, or_out, or_blended
+                d_inp, d_out = None, None
+        else:
+            best_path, best_inp, best_out, best_blended = "openrouter", or_inp, or_out, or_blended
+            d_inp, d_out = None, None
+
+        routes.append({
+            "snapshot_ts":        snapshot_ts,
+            "or_model_id":        or_row["model_id"],
+            "provider":           or_row["provider"],
+            "best_path":          best_path,
+            "best_input_mtok":    round(best_inp, 6),
+            "best_output_mtok":   round(best_out, 6),
+            "best_blended_mtok":  round(best_blended, 6),
+            "or_input_mtok":      or_inp,
+            "or_output_mtok":     or_out,
+            "direct_input_mtok":  d_inp if ll_match else None,
+            "direct_output_mtok": d_out if ll_match else None,
+        })
+    return routes
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
@@ -322,6 +416,22 @@ def store_markups(conn: sqlite3.Connection, rows: list[dict]):
             (:snapshot_ts, :model_id, :provider,
              :direct_input_mtok, :openrouter_input_mtok, :input_markup_pct,
              :direct_output_mtok, :openrouter_output_mtok, :output_markup_pct)
+    """, rows)
+    conn.commit()
+
+
+def store_best_routes(conn: sqlite3.Connection, rows: list[dict]):
+    conn.executemany("""
+        INSERT INTO best_price_snapshots
+            (snapshot_ts, or_model_id, provider,
+             best_path, best_input_mtok, best_output_mtok, best_blended_mtok,
+             or_input_mtok, or_output_mtok,
+             direct_input_mtok, direct_output_mtok)
+        VALUES
+            (:snapshot_ts, :or_model_id, :provider,
+             :best_path, :best_input_mtok, :best_output_mtok, :best_blended_mtok,
+             :or_input_mtok, :or_output_mtok,
+             :direct_input_mtok, :direct_output_mtok)
     """, rows)
     conn.commit()
 
@@ -417,6 +527,13 @@ def main():
     markups = calc_markups(or_rows, ll_rows, snapshot_ts)
     store_markups(conn, markups)
     log.info("Stored %d markup comparisons", len(markups))
+
+    # Best route per model (cheapest of OR vs direct)
+    best_routes = calc_best_routes(or_rows, ll_rows, snapshot_ts)
+    store_best_routes(conn, best_routes)
+    direct_count = sum(1 for r in best_routes if r["best_path"] == "direct")
+    log.info("Stored %d best routes (%d via direct, %d via OR)",
+             len(best_routes), direct_count, len(best_routes) - direct_count)
 
     # Artificial Analysis quality scores
     aa_rows = []

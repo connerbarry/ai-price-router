@@ -109,23 +109,26 @@ class Candidate:
     blended_cost_mtok:  float
     quality_score:      float | None   # dimension relevant to task
     quality_per_dollar: float | None   # quality_score / blended_cost
+    routing_path:       str = "openrouter"   # "openrouter" | "direct"
+    direct_input_mtok:  float | None = None  # direct provider price if available
+    direct_output_mtok: float | None = None
 
 
 # ── Database queries ───────────────────────────────────────────────────────────
 def load_candidates(conn: sqlite3.Connection) -> list[Candidate]:
     """
-    Join latest quality scores with latest OR pricing.
+    Join latest quality scores with pre-computed best prices from best_price_snapshots.
+    Routing path (openrouter vs direct) already decided by agent_mr_price.py daily run.
     Only returns models that are in AA_TO_OR mapping.
     """
-    # Get latest snapshot timestamps
     latest_aa = conn.execute(
         "SELECT MAX(snapshot_ts) FROM quality_snapshots"
     ).fetchone()[0]
-    latest_or = conn.execute(
-        "SELECT MAX(snapshot_ts) FROM price_snapshots WHERE source='openrouter'"
+    latest_bp = conn.execute(
+        "SELECT MAX(snapshot_ts) FROM best_price_snapshots"
     ).fetchone()[0]
 
-    if not latest_aa or not latest_or:
+    if not latest_aa or not latest_bp:
         raise RuntimeError("No data in database. Run agent_mr_price.py first.")
 
     # Pull quality scores
@@ -136,13 +139,49 @@ def load_candidates(conn: sqlite3.Connection) -> list[Candidate]:
         WHERE snapshot_ts = ?
     """, (latest_aa,)).fetchall()
 
-    # Pull OR pricing
-    price_rows = conn.execute("""
-        SELECT model_id, input_cost_mtok, output_cost_mtok
-        FROM price_snapshots
-        WHERE source = 'openrouter' AND snapshot_ts = ? AND is_free = 0
-    """, (latest_or,)).fetchall()
-    or_prices = {r[0]: (r[1], r[2]) for r in price_rows}
+    # Pull best prices (pre-computed cheapest path per model)
+    best_rows = conn.execute("""
+        SELECT or_model_id, best_path, best_input_mtok, best_output_mtok,
+               best_blended_mtok, or_input_mtok, or_output_mtok,
+               direct_input_mtok, direct_output_mtok
+        FROM best_price_snapshots
+        WHERE snapshot_ts = ? AND or_input_mtok > 0
+    """, (latest_bp,)).fetchall()
+    best_prices = {r[0]: r for r in best_rows}
+
+    candidates = []
+    for row in quality_rows:
+        aa_id = row[0]
+        or_id = AA_TO_OR.get(aa_id)
+        if not or_id:
+            continue
+
+        bp = best_prices.get(or_id)
+        if not bp:
+            continue
+
+        _, best_path, inp, out, blended, or_inp, or_out, d_inp, d_out = bp
+
+        candidates.append(Candidate(
+            aa_model_id        = aa_id,
+            model_name         = row[1] or aa_id,
+            or_model_id        = or_id,
+            provider           = or_id.split("/")[0],
+            intelligence_index = row[2],
+            coding_index       = row[3],
+            math_index         = row[4],
+            mmlu_pro           = row[5],
+            input_cost_mtok    = inp,
+            output_cost_mtok   = out,
+            blended_cost_mtok  = blended,
+            quality_score      = None,
+            quality_per_dollar = None,
+            routing_path       = best_path,
+            direct_input_mtok  = d_inp,
+            direct_output_mtok = d_out,
+        ))
+
+    return candidates
 
     candidates = []
     for row in quality_rows:
@@ -273,6 +312,7 @@ def route(
         f"Task: {task_type} | Dimension: {dimension} | "
         f"{len(qualified)} models qualified | "
         f"Winner: {winner.or_model_id} | "
+        f"Path: {winner.routing_path} | "
         f"Score: {winner.quality_score:.1f} | "
         f"QPD: {winner.quality_per_dollar:.1f} | "
         f"Cost: ${winner.blended_cost_mtok:.3f}/MTok"
@@ -280,15 +320,16 @@ def route(
 
     if verbose:
         print(f"\n  Stage 3 — Top {min(top_n, len(ranked))} by quality-per-dollar ({dimension}):")
-        print(f"  {'Model':<45} {'Score':>6} {'$/MTok':>8} {'QPD':>8}")
-        print(f"  {'─'*45} {'─'*6} {'─'*8} {'─'*8}")
+        print(f"  {'Model':<45} {'Score':>6} {'$/MTok':>8} {'QPD':>8} {'Path'}")
+        print(f"  {'─'*45} {'─'*6} {'─'*8} {'─'*8} {'─'*10}")
         for c in ranked[:top_n]:
             marker = " ◄ WINNER" if c is winner else ""
             print(f"  {c.or_model_id:<45} {c.quality_score:>6.1f} "
-                  f"  ${c.blended_cost_mtok:>6.3f} {c.quality_per_dollar:>8.1f}{marker}")
+                  f"  ${c.blended_cost_mtok:>6.3f} {c.quality_per_dollar:>8.1f} "
+                  f"{c.routing_path}{marker}")
         print()
 
-    return winner.or_model_id, winner.blended_cost_mtok, reasoning
+    return winner.or_model_id, winner.blended_cost_mtok, reasoning, winner.routing_path
 
 
 # ── List all available models ──────────────────────────────────────────────────
@@ -319,20 +360,22 @@ def list_models():
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI Cost Router")
-    parser.add_argument("--task",  type=str, help="Task prompt to route")
-    parser.add_argument("--type",  type=str, default="general",
+    parser.add_argument("--task",    type=str, help="Task prompt to route")
+    parser.add_argument("--type",    type=str, default="general",
                         help=f"Task type: {list(TASK_FLOORS.keys())}")
-    parser.add_argument("--top",   type=int, default=5, help="Show top N candidates")
-    parser.add_argument("--list",  action="store_true", help="List all available models")
+    parser.add_argument("--top",     type=int, default=5, help="Show top N candidates")
+    parser.add_argument("--list",    action="store_true", help="List all available models")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed routing stages")
     args = parser.parse_args()
 
     if args.list:
         list_models()
     elif args.task:
-        model, cost, reason = route(args.task, task_type=args.type,
-                                    top_n=args.top, verbose=True)
-        print(f"  → Route to: {model}")
-        print(f"  → Est cost: ${cost:.3f}/MTok (blended)")
+        model, cost, reason, path = route(args.task, task_type=args.type,
+                                          top_n=args.top, verbose=args.verbose)
+        print(f"  → Route to  : {model}")
+        print(f"  → Path      : {path}")
+        print(f"  → Est cost  : ${cost:.3f}/MTok (blended)")
         print(f"  → {reason}\n")
     else:
         # Demo all task types
@@ -345,4 +388,4 @@ if __name__ == "__main__":
         ]
         for prompt, ttype in demos:
             print(f"\n  Task ({ttype}): {prompt[:60]}")
-            model, cost, reason = route(prompt, task_type=ttype, verbose=True)
+            model, cost, reason, path = route(prompt, task_type=ttype, verbose=True)
